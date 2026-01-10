@@ -18,11 +18,48 @@ class EmbeddingModel:
         
         print(f"Loading embedding model: {self.model_name}")
         
-        # Check if it's a Qwen3 model (through SentenceTransformers)
-        if self.model_name.startswith("qwen3"):
+        name = self.model_name or ""
+        name_lc = name.lower()
+
+        # If user points to an Ollama-tagged model like "qwen3-embedding:0.6b",
+        # prefer calling the OpenAI-compatible embeddings endpoint (e.g. http://localhost:11434/v1).
+        # This avoids requiring Hugging Face / SentenceTransformer SBERT layout files.
+        is_ollama_style = (":" in name) and ("/" not in name)
+        if is_ollama_style:
+            self._init_openai_compatible_embeddings()
+            return
+
+        # Otherwise, use SentenceTransformers (supports HF repo ids like "Qwen/Qwen3-Embedding-0.6B")
+        is_qwen3_hf = name_lc.startswith("qwen3") or ("qwen3-embedding" in name_lc)
+        if is_qwen3_hf:
             self._init_qwen3_sentence_transformer()
         else:
             self._init_standard_sentence_transformer()
+
+    def _init_openai_compatible_embeddings(self):
+        """Initialize embeddings via OpenAI-compatible API (e.g., Ollama /v1/embeddings)."""
+        try:
+            from openai import OpenAI
+
+            # Reuse the same base URL as the LLM client; for Ollama this should be http://localhost:11434/v1
+            base_url = getattr(config, "OPENAI_BASE_URL", None)
+            api_key = getattr(config, "OPENAI_API_KEY", "") or "ollama"
+            client_kwargs = {"api_key": api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+
+            self.client = OpenAI(**client_kwargs)
+            self.model_type = "openai_compatible_embeddings"
+            self.supports_query_prompt = False
+            self.dimension = getattr(config, "EMBEDDING_DIMENSION", None)
+            if not self.dimension:
+                # Best-effort default; will be inferred on first encode if needed
+                self.dimension = 0
+
+            print(f"Using OpenAI-compatible embeddings endpoint for model: {self.model_name}")
+        except Exception as e:
+            print(f"Failed to initialize OpenAI-compatible embeddings client: {e}")
+            raise
 
     def _init_qwen3_sentence_transformer(self):
         """Initialize Qwen3 model using SentenceTransformers"""
@@ -78,7 +115,19 @@ class EmbeddingModel:
         """Initialize standard SentenceTransformer model"""
         try:
             from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer(self.model_name)
+            try:
+                self.model = SentenceTransformer(self.model_name)
+            except FileNotFoundError as e:
+                # Some HF transformer repos (e.g. Qwen3 embedding) require trust_remote_code=True
+                # and are not laid out like an SBERT-exported model.
+                missing = str(e).lower()
+                if "sentence_xlnet_config.json" in missing or "sentence_bert_config.json" in missing:
+                    print(
+                        "SentenceTransformer SBERT config missing; retrying with trust_remote_code=True..."
+                    )
+                    self.model = SentenceTransformer(self.model_name, trust_remote_code=True)
+                else:
+                    raise
             self.dimension = self.model.get_sentence_embedding_dimension()
             self.model_type = "sentence_transformer"
             self.supports_query_prompt = False
@@ -105,11 +154,13 @@ class EmbeddingModel:
         if isinstance(texts, str):
             texts = [texts]
         
+        if self.model_type == "openai_compatible_embeddings":
+            return self._encode_openai_compatible(texts)
+
         # Use query prompt for Qwen3 models when encoding queries
         if self.model_type == "qwen3_sentence_transformer" and self.supports_query_prompt and is_query:
             return self._encode_with_query_prompt(texts)
-        else:
-            return self._encode_standard(texts)
+        return self._encode_standard(texts)
 
     def encode_single(self, text: str, is_query: bool = False) -> np.ndarray:
         """
@@ -155,3 +206,23 @@ class EmbeddingModel:
             normalize_embeddings=True
         )
         return embeddings
+
+    def _encode_openai_compatible(self, texts: List[str]) -> np.ndarray:
+        """Encode texts using an OpenAI-compatible embeddings API (e.g., Ollama)."""
+        # OpenAI API expects `input` to be a string or list of strings.
+        response = self.client.embeddings.create(
+            model=self.model_name,
+            input=texts,
+        )
+
+        vectors = [item.embedding for item in response.data]
+        arr = np.asarray(vectors, dtype=np.float32)
+
+        # Infer dimension if not set
+        if not getattr(self, "dimension", None) or self.dimension == 0:
+            self.dimension = int(arr.shape[1]) if arr.ndim == 2 else 0
+
+        # Match previous behavior: normalize embeddings
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        return arr / norms
