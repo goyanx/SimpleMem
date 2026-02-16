@@ -1,16 +1,14 @@
 """
-Vector Store - Structured Multi-View Indexing Implementation (Section 3.2)
+Vector Store - Multi-View Indexing (Section 3.1)
 
-Paper Reference: Section 3.2 - Structured Indexing
-Implements the three structured indexing dimensions:
-- Semantic Layer: Dense vectors v_k ∈ ℝ^d (embedding-based similarity)
-- Lexical Layer: Sparse vectors h_k ∈ ℝ^|V| (BM25/keyword matching)
-- Symbolic Layer: Metadata R_k = {(key, val)} (structured filtering by time, entities, etc.)
+Implements three-layer indexing I(m_k):
+- Semantic Layer: s_k = E_dense(m_k) - Dense vector similarity
+- Lexical Layer: l_k = E_sparse(m_k) - BM25 keyword matching (Tantivy FTS)
+- Symbolic Layer: r_k = E_sym(m_k) - Metadata filtering (SQL)
 """
 from typing import List, Optional, Dict, Any
 import lancedb
 import pyarrow as pa
-import numpy as np
 from models.memory_entry import MemoryEntry
 from utils.embedding import EmbeddingModel
 import config
@@ -19,31 +17,41 @@ import os
 
 class VectorStore:
     """
-    Structured Multi-View Indexing - Storage and retrieval for Atomic Entries
+    Multi-View Indexing - Storage and retrieval for memory units (Section 3.1)
 
-    Paper Reference: Section 3.2 - Structured Indexing
-    Implements M(m_k) with three structured layers:
-    1. Semantic Layer: Dense embedding vectors for conceptual similarity
-    2. Lexical Layer: Sparse keyword vectors for precise term matching
-    3. Symbolic Layer: Structured metadata for deterministic filtering
+    Three-layer indexing I(m_k):
+    1. Semantic Layer: Dense embeddings for conceptual similarity
+    2. Lexical Layer: Tantivy FTS for exact keyword matching
+    3. Symbolic Layer: SQL-based metadata filtering
     """
-    def __init__(self, db_path: str = None, embedding_model: EmbeddingModel = None, table_name: str = None):
+
+    def __init__(
+        self,
+        db_path: str = None,
+        embedding_model: EmbeddingModel = None,
+        table_name: str = None,
+        storage_options: Optional[Dict[str, Any]] = None
+    ):
         self.db_path = db_path or config.LANCEDB_PATH
         self.embedding_model = embedding_model or EmbeddingModel()
-
-        # Connect to database
-        os.makedirs(self.db_path, exist_ok=True)
-        self.db = lancedb.connect(self.db_path)
         self.table_name = table_name or config.MEMORY_TABLE_NAME
         self.table = None
+        self._fts_initialized = False
+
+        # Detect if using cloud storage (GCS, S3, Azure)
+        self._is_cloud_storage = self.db_path.startswith(("gs://", "s3://", "az://"))
+
+        # Connect to database
+        if self._is_cloud_storage:
+            self.db = lancedb.connect(self.db_path, storage_options=storage_options)
+        else:
+            os.makedirs(self.db_path, exist_ok=True)
+            self.db = lancedb.connect(self.db_path)
 
         self._init_table()
 
     def _init_table(self):
-        """
-        Initialize table schema
-        """
-        # Define schema
+        """Initialize table schema and FTS index."""
         schema = pa.schema([
             pa.field("entry_id", pa.string()),
             pa.field("lossless_restatement", pa.string()),
@@ -56,7 +64,6 @@ class VectorStore:
             pa.field("vector", pa.list_(pa.float32(), self.embedding_model.dimension))
         ])
 
-        # Create table if it doesn't exist
         if self.table_name not in self.db.table_names():
             self.table = self.db.create_table(self.table_name, schema=schema)
             print(f"Created new table: {self.table_name}")
@@ -64,18 +71,61 @@ class VectorStore:
             self.table = self.db.open_table(self.table_name)
             print(f"Opened existing table: {self.table_name}")
 
+    def _init_fts_index(self):
+        """Initialize Full-Text Search index on lossless_restatement column."""
+        if self._fts_initialized:
+            return
+
+        try:
+            if self._is_cloud_storage:
+                # Use native FTS for cloud storage (Tantivy only works with local filesystem)
+                self.table.create_fts_index(
+                    "lossless_restatement",
+                    use_tantivy=False,
+                    replace=True
+                )
+                print("FTS index created (native mode for cloud storage)")
+            else:
+                # Use Tantivy FTS for local storage (better performance)
+                self.table.create_fts_index(
+                    "lossless_restatement",
+                    use_tantivy=True,
+                    tokenizer_name="en_stem",
+                    replace=True
+                )
+                print("FTS index created (Tantivy mode)")
+            self._fts_initialized = True
+        except Exception as e:
+            print(f"FTS index creation skipped: {e}")
+
+    def _results_to_entries(self, results: List[dict]) -> List[MemoryEntry]:
+        """Convert LanceDB results to MemoryEntry objects."""
+        entries = []
+        for r in results:
+            try:
+                entries.append(MemoryEntry(
+                    entry_id=r["entry_id"],
+                    lossless_restatement=r["lossless_restatement"],
+                    keywords=list(r.get("keywords") or []),
+                    timestamp=r.get("timestamp") or None,
+                    location=r.get("location") or None,
+                    persons=list(r.get("persons") or []),
+                    entities=list(r.get("entities") or []),
+                    topic=r.get("topic") or None
+                ))
+            except Exception as e:
+                print(f"Warning: Failed to parse result: {e}")
+                continue
+        return entries
+
     def add_entries(self, entries: List[MemoryEntry]):
-        """
-        Batch add memory entries
-        """
+        """Batch add memory entries."""
         if not entries:
             return
 
-        # Generate vectors (encode documents without query prompt)
         restatements = [entry.lossless_restatement for entry in entries]
         vectors = self.embedding_model.encode_documents(restatements)
 
-        # Build data
         data = []
         for entry, vector in zip(entries, vectors):
             data.append({
@@ -90,48 +140,25 @@ class VectorStore:
                 "vector": vector.tolist()
             })
 
-        # Add to table
         self.table.add(data)
         print(f"Added {len(entries)} memory entries")
 
+        # Initialize FTS index after first data insertion
+        if not self._fts_initialized:
+            self._init_fts_index()
+
     def semantic_search(self, query: str, top_k: int = 5) -> List[MemoryEntry]:
         """
-        Semantic Layer Search - Dense vector similarity
-
-        Paper Reference: Section 3.1
-        Retrieves based on v_k = E_dense(S_k) where S_k is the lossless restatement
+        Semantic Layer Search - Dense vector similarity (Section 3.1)
+        s_k = E_dense(m_k)
         """
         try:
-            # Check if table is empty
             if self.table.count_rows() == 0:
                 return []
 
-            # Generate query vector (use query prompt optimization for Qwen3)
             query_vector = self.embedding_model.encode_single(query, is_query=True)
-
-            # Execute vector search
             results = self.table.search(query_vector.tolist()).limit(top_k).to_list()
-
-            # Convert to MemoryEntry objects
-            entries = []
-            for result in results:
-                try:
-                    entry = MemoryEntry(
-                        entry_id=result["entry_id"],
-                        lossless_restatement=result["lossless_restatement"],
-                        keywords=list(result["keywords"]) if result["keywords"] is not None else [],
-                        timestamp=result["timestamp"] if result["timestamp"] else None,
-                        location=result["location"] if result["location"] else None,
-                        persons=list(result["persons"]) if result["persons"] is not None else [],
-                        entities=list(result["entities"]) if result["entities"] is not None else [],
-                        topic=result["topic"] if result["topic"] else None
-                    )
-                    entries.append(entry)
-                except Exception as e:
-                    print(f"Warning: Failed to parse search result: {e}")
-                    continue
-
-            return entries
+            return self._results_to_entries(results)
 
         except Exception as e:
             print(f"Error during semantic search: {e}")
@@ -139,62 +166,17 @@ class VectorStore:
 
     def keyword_search(self, keywords: List[str], top_k: int = 3) -> List[MemoryEntry]:
         """
-        Lexical Layer Search - Sparse keyword matching
-
-        Paper Reference: Section 3.1
-        Retrieves based on h_k = Sparse(S_k) for precise term and entity matching
-        Uses inclusion-based scoring (approximates BM25)
+        Lexical Layer Search - BM25 keyword matching (Section 3.1)
+        l_k = E_sparse(m_k)
         """
         try:
-            # Get all entries (should use more efficient method in production)
-            all_entries = self.table.to_pandas()
-
-            # Handle empty table
-            if len(all_entries) == 0:
+            if not keywords or self.table.count_rows() == 0:
                 return []
 
-            # Handle empty keywords
-            if not keywords:
-                return []
-
-            # Calculate matching scores
-            scored_entries = []
-            for _, row in all_entries.iterrows():
-                try:
-                    score = 0
-                    # Convert to list to avoid array truth value ambiguity
-                    row_keywords = list(row["keywords"]) if row["keywords"] is not None else []
-                    row_text = str(row["lossless_restatement"]).lower()
-
-                    for kw in keywords:
-                        kw_lower = str(kw).lower()
-                        # Keyword list matching
-                        if len(row_keywords) > 0 and any(kw_lower in str(rk).lower() for rk in row_keywords):
-                            score += 2
-                        # Text matching
-                        if kw_lower in row_text:
-                            score += 1
-
-                    if score > 0:
-                        # Convert arrays to lists for MemoryEntry
-                        entry = MemoryEntry(
-                            entry_id=row["entry_id"],
-                            lossless_restatement=row["lossless_restatement"],
-                            keywords=list(row["keywords"]) if row["keywords"] is not None else [],
-                            timestamp=row["timestamp"] if row["timestamp"] else None,
-                            location=row["location"] if row["location"] else None,
-                            persons=list(row["persons"]) if row["persons"] is not None else [],
-                            entities=list(row["entities"]) if row["entities"] is not None else [],
-                            topic=row["topic"] if row["topic"] else None
-                        )
-                        scored_entries.append((score, entry))
-                except Exception as e:
-                    print(f"Warning: Failed to process row in keyword search: {e}")
-                    continue
-
-            # Sort by score and return top_k
-            scored_entries.sort(reverse=True, key=lambda x: x[0])
-            return [entry for _, entry in scored_entries[:top_k]]
+            # LanceDB auto-detects string input as FTS query when FTS index exists
+            query = " ".join(keywords)
+            results = self.table.search(query).limit(top_k).to_list()
+            return self._results_to_entries(results)
 
         except Exception as e:
             print(f"Error during keyword search: {e}")
@@ -209,119 +191,60 @@ class VectorStore:
         top_k: Optional[int] = None
     ) -> List[MemoryEntry]:
         """
-        Symbolic Layer Search - Metadata-based deterministic filtering
-
-        Paper Reference: Section 3.1
-        Retrieves based on R_k = {(key, val)} for structured constraints
-        Enables precise filtering by time, entities, persons, and locations
-
-        Args:
-            persons: Filter by person names
-            timestamp_range: Filter by time range (start, end)
-            location: Filter by location
-            entities: Filter by entities
-            top_k: Maximum number of results to return (default: no limit)
+        Symbolic Layer Search - Metadata filtering (Section 3.1)
+        r_k = E_sym(m_k), filters by timestamps, entities, persons
         """
         try:
-            df = self.table.to_pandas()
-
-            # Handle empty dataframe
-            if len(df) == 0:
+            if self.table.count_rows() == 0:
                 return []
 
-            # If no filters provided, return empty
             if not any([persons, timestamp_range, location, entities]):
                 return []
 
-            # Apply filters using numpy array for proper pandas boolean indexing
-            mask = np.ones(len(df), dtype=bool)
+            conditions = []
 
             if persons:
-                person_mask = np.array([
-                    any(p in list(row["persons"]) for p in persons) if row["persons"] is not None else False
-                    for _, row in df.iterrows()
-                ])
-                mask = mask & person_mask
+                values = ", ".join([f"'{p}'" for p in persons])
+                conditions.append(f"array_has_any(persons, make_array({values}))")
 
             if location:
-                location_mask = np.array([
-                    location.lower() in str(row["location"]).lower() if row["location"] is not None else False
-                    for _, row in df.iterrows()
-                ])
-                mask = mask & location_mask
+                safe_location = location.replace("'", "''")
+                conditions.append(f"location LIKE '%{safe_location}%'")
 
             if entities:
-                entity_mask = np.array([
-                    any(e in list(row["entities"]) for e in entities) if row["entities"] is not None else False
-                    for _, row in df.iterrows()
-                ])
-                mask = mask & entity_mask
+                values = ", ".join([f"'{e}'" for e in entities])
+                conditions.append(f"array_has_any(entities, make_array({values}))")
 
             if timestamp_range:
                 start_time, end_time = timestamp_range
-                timestamp_mask = np.array([
-                    bool(row["timestamp"] and start_time <= row["timestamp"] <= end_time)
-                    for _, row in df.iterrows()
-                ])
-                mask = mask & timestamp_mask
+                conditions.append(f"timestamp >= '{start_time}' AND timestamp <= '{end_time}'")
 
-            # Build results - use numpy boolean array for filtering
-            filtered_df = df[mask]
+            where_clause = " AND ".join(conditions)
+            query = self.table.search().where(where_clause, prefilter=True)
 
-            # Limit results if top_k is specified
-            if top_k is not None and len(filtered_df) > top_k:
-                filtered_df = filtered_df.head(top_k)
+            if top_k:
+                query = query.limit(top_k)
 
-            entries = []
-            for _, row in filtered_df.iterrows():
-                try:
-                    entry = MemoryEntry(
-                        entry_id=row["entry_id"],
-                        lossless_restatement=row["lossless_restatement"],
-                        keywords=list(row["keywords"]) if row["keywords"] is not None else [],
-                        timestamp=row["timestamp"] if row["timestamp"] else None,
-                        location=row["location"] if row["location"] else None,
-                        persons=list(row["persons"]) if row["persons"] is not None else [],
-                        entities=list(row["entities"]) if row["entities"] is not None else [],
-                        topic=row["topic"] if row["topic"] else None
-                    )
-                    entries.append(entry)
-                except Exception as e:
-                    print(f"Warning: Failed to parse filtered row: {e}")
-                    continue
-
-            return entries
+            results = query.to_list()
+            return self._results_to_entries(results)
 
         except Exception as e:
             print(f"Error during structured search: {e}")
-            import traceback
-            traceback.print_exc()
             return []
 
     def get_all_entries(self) -> List[MemoryEntry]:
-        """
-        Get all memory entries
-        """
-        df = self.table.to_pandas()
-        entries = []
-        for _, row in df.iterrows():
-            entry = MemoryEntry(
-                entry_id=row["entry_id"],
-                lossless_restatement=row["lossless_restatement"],
-                keywords=list(row["keywords"]) if row["keywords"] is not None else [],
-                timestamp=row["timestamp"] if row["timestamp"] else None,
-                location=row["location"] if row["location"] else None,
-                persons=list(row["persons"]) if row["persons"] is not None else [],
-                entities=list(row["entities"]) if row["entities"] is not None else [],
-                topic=row["topic"] if row["topic"] else None
-            )
-            entries.append(entry)
-        return entries
+        """Get all memory entries."""
+        results = self.table.to_arrow().to_pylist()
+        return self._results_to_entries(results)
+
+    def optimize(self):
+        """Optimize table after bulk insertions for better query performance."""
+        self.table.optimize()
+        print("Table optimized")
 
     def clear(self):
-        """
-        Clear all data
-        """
+        """Clear all data and reinitialize table."""
         self.db.drop_table(self.table_name)
+        self._fts_initialized = False
         self._init_table()
         print("Database cleared")

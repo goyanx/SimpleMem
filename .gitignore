@@ -84,3 +84,4 @@ test_results/
 *.pt
 *.pth
 *.onnx
+docs/other

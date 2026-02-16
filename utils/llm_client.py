@@ -34,7 +34,11 @@ class LLMClient:
         if self.enable_thinking:
             print(f"Deep thinking mode enabled")
 
-        self.client = OpenAI(**client_kwargs)
+        # self.client = OpenAI(**client_kwargs)
+        self.client = OpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+        )
 
     def chat_completion(
         self,
@@ -82,8 +86,12 @@ class LLMClient:
                 else:
                     response = self.client.chat.completions.create(**kwargs)
                     return response.choices[0].message.content
+                
+                # kwargs["stream"] = True
+                # return self._handle_streaming_response(**kwargs)
                     
             except Exception as e:
+                # print(e)
                 last_exception = e
                 if attempt < max_retries - 1:
                     import time
@@ -104,13 +112,23 @@ class LLMClient:
         full_content = []
         stream = self.client.chat.completions.create(**kwargs)
 
+        # for chunk in stream:
+        #     if chunk.choices is not None:
+        #         print(chunk.choices[0].delta.content)
+        
+        # print('---------')
+
         for chunk in stream:
-            if chunk.choices[0].delta.content is not None:
+            # print(chunk)
+            # fix list index out of range
+            if len(chunk.choices) > 0 and chunk.choices[0].delta.content is not None:
                 content = chunk.choices[0].delta.content
                 full_content.append(content)
+                # print(full_content)
                 # Optional: print streaming content in real-time
                 # print(content, end='', flush=True)
-
+        # print(full_content)
+        print()
         return ''.join(full_content)
 
     def extract_json(self, text: str) -> Any:
