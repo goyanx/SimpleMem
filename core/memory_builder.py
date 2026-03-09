@@ -39,7 +39,11 @@ class MemoryBuilder:
         self.llm_client = llm_client
         self.vector_store = vector_store
         self.window_size = window_size or config.WINDOW_SIZE
-        
+        self.overlap_size = getattr(config, 'OVERLAP_SIZE', 0)
+        # step_size is how far the window advances each iteration; overlap retains
+        # the last overlap_size dialogues so the next window has continuity context
+        self.step_size = max(1, self.window_size - self.overlap_size)
+
         # Use config values as default if not explicitly provided
         self.enable_parallel_processing = enable_parallel_processing if enable_parallel_processing is not None else getattr(config, 'ENABLE_PARALLEL_PROCESSING', True)
         self.max_parallel_workers = max_parallel_workers if max_parallel_workers is not None else getattr(config, 'MAX_PARALLEL_WORKERS', 4)
@@ -82,34 +86,47 @@ class MemoryBuilder:
         """
         Add dialogues using parallel processing for better performance
         """
+        # Snapshot pre-existing buffer items so the fallback can restore them
+        # if the buffer is cleared mid-way through parallel processing
+        pre_existing = list(self.dialogue_buffer)
+        windows_to_process = []
         try:
             # Add all dialogues to buffer first
             self.dialogue_buffer.extend(dialogues)
-            
-            # Group into windows for parallel processing (including remaining dialogues)
-            windows_to_process = []
-            while len(self.dialogue_buffer) >= self.window_size:
-                window = self.dialogue_buffer[:self.window_size]
-                self.dialogue_buffer = self.dialogue_buffer[self.window_size:]
+
+            # Group into windows using step_size so that each window retains
+            # overlap_size dialogues of context from the previous window
+            pos = 0
+            while pos + self.window_size <= len(self.dialogue_buffer):
+                window = self.dialogue_buffer[pos:pos + self.window_size]
                 windows_to_process.append(window)
-            
+                pos += self.step_size
+
             # Add remaining dialogues as a smaller batch (no need to process separately)
-            if self.dialogue_buffer:
-                windows_to_process.append(self.dialogue_buffer)
-                self.dialogue_buffer = []  # Clear buffer since we're processing all
-            
+            remaining = self.dialogue_buffer[pos:]
+            if remaining:
+                windows_to_process.append(remaining)
+            self.dialogue_buffer = []  # Clear buffer since we're processing all
+
             if windows_to_process:
                 print(f"\n[Parallel Processing] Processing {len(windows_to_process)} batches in parallel with {self.max_parallel_workers} workers")
                 print(f"Batch sizes: {[len(w) for w in windows_to_process]}")
-                
+
                 # Process all windows/batches in parallel (including remaining dialogues)
                 self._process_windows_parallel(windows_to_process)
-                
+
         except Exception as e:
             print(f"[Parallel Processing] Failed: {e}. Falling back to sequential processing...")
-            # Fallback to sequential processing
-            for window in windows_to_process:
-                self.dialogue_buffer = window + self.dialogue_buffer
+            # Fallback: overlapping windows cannot be re-stacked naively.
+            # If the buffer was cleared (exception after line 107), restore the full
+            # original state: pre-existing items that were already in the buffer
+            # PLUS the new dialogues we were asked to process.
+            # If the buffer was NOT cleared (exception before line 107), it already
+            # contains pre_existing + dialogues, so leave it as-is.
+            if not self.dialogue_buffer:
+                self.dialogue_buffer = pre_existing + list(dialogues)
+            # process_window() uses step_size, so overlap is handled correctly here
+            while len(self.dialogue_buffer) >= self.window_size:
                 self.process_window()
 
     def process_window(self):
@@ -119,9 +136,10 @@ class MemoryBuilder:
         if not self.dialogue_buffer:
             return
 
-        # Extract window
+        # Extract window; advance by step_size to retain overlap_size dialogues
+        # at the tail so the next window has continuity context
         window = self.dialogue_buffer[:self.window_size]
-        self.dialogue_buffer = self.dialogue_buffer[self.window_size:]
+        self.dialogue_buffer = self.dialogue_buffer[self.step_size:]
 
         print(f"\nProcessing window: {len(window)} dialogues (processed {self.processed_count} so far)")
 
